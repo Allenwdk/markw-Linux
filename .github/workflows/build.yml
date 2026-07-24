@@ -194,19 +194,30 @@ jobs:
 
       - name: 创建 rootfs 镜像
         run: |
-          dd if=/dev/zero of=rootfs.ext4 bs=1M count="${{ inputs.rootfs_size_mb }}"
+          # 使用 truncate 创建稀疏文件，避免真实写入 ${{ inputs.rootfs_size_mb }}MB 的零数据
+          truncate -s ${{ inputs.rootfs_size_mb }}M rootfs.ext4
           sudo mkfs.ext4 rootfs.ext4
-          # 获取 UUID 用于 boot.img cmdline
+          # 获取 UUID 用于 boot.img cmdline（resize2fs 不会改变 UUID）
           ROOTFS_UUID=$(sudo blkid -o value -s UUID rootfs.ext4)
           echo "ROOTFS_UUID=$ROOTFS_UUID" >> "$GITHUB_ENV"
 
           sudo mkdir -p mnt
           sudo mount rootfs.ext4 mnt
           sudo rsync -qaHAXS rootfs/ mnt/
+          # 丢弃未使用块，确保 img2simg 能识别为零块而跳过
+          sudo fstrim -v mnt || true
           sudo umount -R mnt
+
+          # 检查并缩小 ext4 文件系统到最小，让最终镜像只包含实际数据
+          # 而不是和预留空间一样大
+          sudo e2fsck -fy rootfs.ext4
+          sudo resize2fs -M rootfs.ext4
 
           # 转换为 sparse image
           img2simg rootfs.ext4 rootfs.img
+
+          echo "最终镜像大小："
+          ls -lh rootfs.img
 
       - name: 构建 boot.img
         run: |
