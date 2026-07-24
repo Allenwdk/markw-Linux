@@ -143,9 +143,13 @@ jobs:
 
       - name: 安装 firmware
         run: |
-          sudo mkdir -p rootfs/lib/firmware
-          # 仓库中已提供 firmware，直接复制到 rootfs
-          sudo cp -r firmware/* rootfs/lib/firmware/
+          # 只复制 markw (MSM8953) 需要的固件
+          # firmware 目录包含几十种不相关芯片的固件，全量复制会让 rootfs 膨胀到 ~3GB
+          sudo mkdir -p rootfs/lib/firmware/qcom
+          sudo cp -r firmware/qcom/msm8953 rootfs/lib/firmware/qcom/
+          sudo mkdir -p rootfs/lib/firmware/ath10k
+          sudo cp -r firmware/ath10k/QCA6174 rootfs/lib/firmware/ath10k/
+          sudo cp -r firmware/qca rootfs/lib/firmware/
 
       - name: 安装系统软件包
         run: |
@@ -196,6 +200,23 @@ jobs:
           rm -f ~/.bash_history 2>/dev/null || true
           CHROOT_EOF
           sudo umount -R rootfs 2>/dev/null || true
+
+      - name: 清理无用固件并检查空间占用
+        run: |
+          # linux-firmware-qcom 会安装大量其他 SoC 的固件，markw 只需要 msm8953
+          sudo find rootfs/lib/firmware/qcom -mindepth 1 -maxdepth 1 ! -name msm8953 -exec rm -rf {} +
+          # ath11k/ath12k 是 WiFi 6/7 固件，SD625 不需要
+          sudo rm -rf rootfs/lib/firmware/ath11k rootfs/lib/firmware/ath12k
+
+          echo "::group::rootfs 各目录占用"
+          sudo du -sh rootfs/*
+          echo "::endgroup::"
+          echo "::group::firmware 各目录占用"
+          sudo du -sh rootfs/lib/firmware/* 2>/dev/null || echo "firmware 目录为空"
+          echo "::endgroup::"
+          echo "::group::rootfs 总占用"
+          sudo du -sh rootfs/
+          echo "::endgroup::"
 
       - name: 创建 rootfs 镜像
         run: |
