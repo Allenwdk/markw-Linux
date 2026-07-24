@@ -121,6 +121,9 @@ jobs:
           sudo arch-chroot rootfs /bin/bash <<'CHROOT_EOF'
           set -ex
 
+          # 先装 wget/curl 供后续下载 keyring 使用
+          pacman -Sy --noconfirm wget curl
+
           # 添加 danctnix 源
           printf '\n[danctnix]\nServer = https://p64.arikawa-hi.me/$repo/$arch/\n' >> /etc/pacman.conf
 
