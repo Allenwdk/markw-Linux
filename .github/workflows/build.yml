@@ -1,3 +1,4 @@
+# GitHub Actions workflow for building Arch Linux for markw
 name: Build Arch Linux for markw
 
 on:
