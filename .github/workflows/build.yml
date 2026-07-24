@@ -1,0 +1,215 @@
+name: Build Arch Linux for markw
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_tag:
+        description: '内核标签 (如 v7.1.3-r0)'
+        required: false
+        default: 'v7.1.3-r0'
+      rootfs_size_mb:
+        description: 'rootfs 镜像大小 (MB)'
+        required: false
+        default: '3072'
+
+env:
+  ARCH: arm64
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout 仓库
+        uses: actions/checkout@v4
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential openssl pkg-config libssl-dev libncurses5-dev \
+            libelf-dev flex bison libc6-dev libidn11-dev rsync bc \
+            liblz4-tool dtc kmod git wget curl cpio \
+            arch-install-scripts \
+            android-sdk-libsparse-utils \
+            mkbootimg \
+            util-linux
+
+      - name: 缓存 ArchLinuxARM rootfs
+        id: cache-rootfs
+        uses: actions/cache@v4
+        with:
+          path: ArchLinuxARM-aarch64-latest.tar.gz
+          key: archlinuxarm-aarch64-latest
+
+      - name: 下载 ArchLinuxARM rootfs
+        if: steps.cache-rootfs.outputs.cache-hit != 'true'
+        run: |
+          wget -q --show-progress http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz
+
+      - name: 拉取内核源码
+        run: |
+          git clone https://github.com/msm8953-mainline/linux.git -b "${{ inputs.kernel_tag }}" --depth 1
+
+      - name: 下载并处理内核 config
+        run: |
+          curl -L -o config \
+            https://gitlab.postmarketos.org/postmarketOS/pmaports/-/raw/main/device/community/linux-postmarketos-qcom-msm8953/config-postmarketos-qcom-msm8953.aarch64
+          chmod +x check.sh
+          ./check.sh config -w
+          # 模块压缩设为 none，否则 Debian/Arch 不开机
+          echo "CONFIG_MODULE_COMPRESS_NONE=y" >> config
+          cp config linux/.config
+
+      - name: 编译内核
+        run: |
+          cd linux
+          make ARCH=arm64 olddefconfig
+          make ARCH=arm64 -j$(nproc) Image Image.gz modules
+          # 生成带符号的 dtbs 以支持 U-Boot 设备树覆盖
+          make ARCH=arm64 -j$(nproc) DTC_FLAGS="-@" dtbs
+
+      - name: 释放 rootfs
+        run: |
+          mkdir -p rootfs
+          sudo tar axf ArchLinuxARM-aarch64-latest.tar.gz -C rootfs
+          # arch-chroot 需要 rootfs 作为挂载点
+          sudo mount --bind "$PWD/rootfs" "$PWD/rootfs"
+
+      - name: 配置 rootfs 基础环境
+        run: |
+          sudo arch-chroot rootfs /bin/bash <<'CHROOT_EOF'
+          set -ex
+          ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+
+          # 初始化 pacman keyring
+          pacman-key --init
+          pacman-key --populate archlinuxarm
+
+          # 卸载预装的内核及 firmware
+          pacman -R --noconfirm linux-aarch64 linux-firmware linux-firmware-whence 2>/dev/null || true
+          pacman -R --noconfirm $(pacman -Qq | grep '^linux-firmware-' 2>/dev/null) 2>/dev/null || true
+
+          # 禁用 pacman 沙盒
+          sed -i '/\[options\]/a DisableSandbox' /etc/pacman.conf
+
+          # 更新系统
+          pacman -Syu --noconfirm
+          CHROOT_EOF
+
+      - name: 安装内核到 rootfs
+        run: |
+          cd linux
+          sudo make ARCH=arm64 INSTALL_MOD_PATH="$PWD/../rootfs" modules_install
+          sudo cp arch/arm64/boot/Image arch/arm64/boot/Image.gz "$PWD/../rootfs/boot/"
+          sudo cp arch/arm64/boot/dts/qcom/msm8953*.dtb "$PWD/../rootfs/boot/"
+          # 移除 modules 目录中的 build/source 符号链接
+          kerver=$(ls "$PWD/../rootfs/usr/lib/modules")
+          sudo rm -f "$PWD/../rootfs/usr/lib/modules/$kerver/source" \
+                     "$PWD/../rootfs/usr/lib/modules/$kerver/build"
+
+      - name: 安装 firmware
+        run: |
+          sudo mkdir -p rootfs/lib/firmware
+          # 仓库中已提供 firmware，直接复制到 rootfs
+          sudo cp -r firmware/* rootfs/lib/firmware/
+
+      - name: 安装系统软件包
+        run: |
+          sudo arch-chroot rootfs /bin/bash <<'CHROOT_EOF'
+          set -ex
+
+          # 添加 danctnix 源
+          printf '\n[danctnix]\nServer = https://p64.arikawa-hi.me/$repo/$arch/\n' >> /etc/pacman.conf
+
+          # 安装 danctnix keyring
+          cd /root
+          wget -q https://p64.arikawa-hi.me/danctnix/aarch64/danctnix-keyring-2-1-any.pkg.tar.xz
+          pacman -U --noconfirm danctnix-keyring-2-1-any.pkg.tar.xz
+          rm -f danctnix-keyring-2-1-any.pkg.tar.xz
+          pacman -Syu --noconfirm
+
+          # 安装必要软件
+          pacman -S --noconfirm networkmanager modemmanager bluez bluez-utils qrtr rmtfs git wget usbutils
+          pacman -S --noconfirm danctnix-usb-tethering openssh
+
+          # 安装 qcom firmware (冲突的文件用 --overwrite 覆盖)
+          pacman -S --noconfirm --overwrite '*' linux-firmware-qcom 2>/dev/null || true
+
+          # 启用服务
+          systemctl enable NetworkManager
+          systemctl enable bluetooth
+          systemctl enable rmtfs
+          systemctl enable ModemManager
+          systemctl enable usb-tethering
+          systemctl enable sshd
+          CHROOT_EOF
+
+      - name: 生成 initrd
+        run: |
+          sudo arch-chroot rootfs /bin/bash <<'CHROOT_EOF'
+          set -ex
+          kerver=$(ls /usr/lib/modules)
+          mkinitcpio --generate /boot/initrd.img-$kerver --kernel $kerver
+          CHROOT_EOF
+
+      - name: 清理 rootfs 缓存
+        run: |
+          sudo arch-chroot rootfs /bin/bash <<'CHROOT_EOF'
+          yes | pacman -Scc
+          rm -f ~/.bash_history 2>/dev/null || true
+          CHROOT_EOF
+          sudo umount -R rootfs 2>/dev/null || true
+
+      - name: 创建 rootfs 镜像
+        run: |
+          dd if=/dev/zero of=rootfs.ext4 bs=1M count="${{ inputs.rootfs_size_mb }}"
+          sudo mkfs.ext4 rootfs.ext4
+          # 获取 UUID 用于 boot.img cmdline
+          ROOTFS_UUID=$(sudo blkid -o value -s UUID rootfs.ext4)
+          echo "ROOTFS_UUID=$ROOTFS_UUID" >> "$GITHUB_ENV"
+
+          sudo mkdir -p mnt
+          sudo mount rootfs.ext4 mnt
+          sudo rsync -qaHAXS rootfs/ mnt/
+          sudo umount -R mnt
+
+          # 转换为 sparse image
+          img2simg rootfs.ext4 rootfs.img
+
+      - name: 构建 boot.img
+        run: |
+          mkdir -p mkboot
+          cp linux/arch/arm64/boot/Image.gz linux/arch/arm64/boot/dts/qcom/msm8953-xiaomi-markw.dtb mkboot/
+          sudo cp rootfs/boot/initrd.img* mkboot/initrd.img
+          sudo chown "$(whoami):$(whoami)" mkboot/initrd.img
+
+          cd mkboot
+          # 为 kernel 附加设备树
+          cat Image.gz msm8953-xiaomi-markw.dtb > kernel-dtb
+
+          mkbootimg \
+            --base 0x80000000 \
+            --kernel_offset 0x00080000 \
+            --ramdisk_offset 0x02000000 \
+            --tags_offset 0x01e00000 \
+            --pagesize 2048 \
+            --second_offset 0x00f00000 \
+            --ramdisk initrd.img \
+            --cmdline "console=tty0 root=UUID=${{ env.ROOTFS_UUID }} rw loglevel=3" \
+            --kernel kernel-dtb -o boot.img
+
+      - name: 上传 rootfs.img
+        uses: actions/upload-artifact@v4
+        with:
+          name: rootfs-img
+          path: rootfs.img
+          retention-days: 14
+
+      - name: 上传 boot.img
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-img
+          path: mkboot/boot.img
+          retention-days: 14
