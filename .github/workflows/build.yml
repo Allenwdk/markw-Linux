@@ -35,7 +35,8 @@ jobs:
             arch-install-scripts \
             android-sdk-libsparse-utils \
             mkbootimg \
-            util-linux
+            util-linux \
+            ccache
 
       - name: 缓存 ArchLinuxARM rootfs
         id: cache-rootfs
@@ -63,13 +64,38 @@ jobs:
           echo "CONFIG_MODULE_COMPRESS_NONE=y" >> config
           cp config linux/.config
 
+      - name: 缓存 ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          # kernel_tag 变化或源码 commit 变化都会刷新 key；
+          # restore-keys 允许在同 tag 下跨 commit 复用，以及跨 tag 部分命中
+          key: ccache-kernel-${{ inputs.kernel_tag }}-${{ github.sha }}
+          restore-keys: |
+            ccache-kernel-${{ inputs.kernel_tag }}-
+            ccache-kernel-
+
+      - name: 配置 ccache
+        run: |
+          ccache --set-config=max_size=2G
+          ccache --set-config=compression=true
+          ccache --set-config=hash_dir=false
+          ccache -z
+          ccache -p
+
       - name: 编译内核
         run: |
           cd linux
+          # 使用 ccache 包装交叉编译器与主机编译器
+          export CC="ccache aarch64-linux-gnu-gcc"
+          export HOSTCC="ccache gcc"
           make ARCH=arm64 olddefconfig
           make ARCH=arm64 -j$(nproc) Image Image.gz modules
           # 生成带符号的 dtbs 以支持 U-Boot 设备树覆盖
           make ARCH=arm64 -j$(nproc) DTC_FLAGS="-@" dtbs
+          echo "::group::ccache 统计"
+          ccache -s
+          echo "::endgroup::"
 
       - name: 释放 rootfs
         run: |
