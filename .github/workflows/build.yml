@@ -40,7 +40,7 @@ jobs:
 
       - name: 缓存 ArchLinuxARM rootfs
         id: cache-rootfs
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ArchLinuxARM-aarch64-latest.tar.gz
           key: archlinuxarm-aarch64-latest
@@ -65,7 +65,7 @@ jobs:
           cp config linux/.config
 
       - name: 缓存 ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.ccache
           # kernel_tag 变化或源码 commit 变化都会刷新 key；
@@ -77,11 +77,16 @@ jobs:
 
       - name: 配置 ccache
         run: |
+          # 显式指定 cache_dir 与 actions/cache 的 path 一致
+          # (ccache 4.x 默认是 ~/.cache/ccache, 不显式设置会导致 post-job 找不到路径)
+          ccache --set-config=cache_dir="$HOME/.ccache"
           ccache --set-config=max_size=2G
           ccache --set-config=compression=true
           ccache --set-config=hash_dir=false
+          # 预创建目录,避免 actions-cache 在没有任何缓存写入时报警告
+          mkdir -p "$HOME/.ccache"
           ccache -z
-          ccache -p
+          ccache -p | grep -E 'cache_dir|max_size|compression|hash_dir'
 
       - name: 编译内核
         run: |
