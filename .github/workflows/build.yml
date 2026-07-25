@@ -199,8 +199,17 @@ jobs:
 
       - name: 检查 rootfs 空间占用
         run: |
-          echo "::group::rootfs 各目录占用"
-          sudo du -sh rootfs/*
+          echo "::group::rootfs 顶层目录占用"
+          sudo du -sh rootfs/* 2>/dev/null
+          echo "::endgroup::"
+          echo "::group::rootfs/usr 各目录占用"
+          sudo du -sh rootfs/usr/* 2>/dev/null | sort -rh
+          echo "::endgroup::"
+          echo "::group::rootfs/usr/lib 各目录占用 (top 20)"
+          sudo du -sh rootfs/usr/lib/* 2>/dev/null | sort -rh | head -20
+          echo "::endgroup::"
+          echo "::group::rootfs/usr/share 各目录占用 (top 20)"
+          sudo du -sh rootfs/usr/share/* 2>/dev/null | sort -rh | head -20
           echo "::endgroup::"
           echo "::group::rootfs 总占用"
           sudo du -sh rootfs/
